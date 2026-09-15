@@ -2,7 +2,7 @@
 
 A self-contained Discord bot that recreates the feeling of "streaks":
 every member keeps a personal streak alive by sending at least one
-message or image anywhere in the server each day.
+message, image, or video anywhere in the server each day.
 
 The bot lives inside a single permanent dashboard message with buttons.
 Slash commands are not required for normal use.
@@ -190,8 +190,11 @@ A member's daily requirement is satisfied by any one of:
 
 - A normal text message anywhere in the server.
 - A message with an image attachment anywhere in the server.
+- A message with a video attachment anywhere in the server.
 
-Multiple messages in a day still only count once. The following never
+Any combination of text, images, and videos in the same message still
+only counts once, and multiple qualifying messages in a day still only
+count once. The following never
 count: bot messages, webhook messages, reactions, button interactions,
 and system messages. Members do not need to post in any specific
 channel — activity anywhere in the guild counts.
@@ -255,8 +258,8 @@ configuration.
 ## 22. Data Retention
 
 - Detailed daily activity records (which day a member sent a qualifying
-  message or image) are retained for approximately the last 3 months.
-  Rows older than that are deleted automatically once a day.
+  message, image, or video) are retained for approximately the last 3
+  months. Rows older than that are deleted automatically once a day.
 - Streak counters are **not** derived from those detailed records. Each
   member's `current_streak`, `longest_streak`, `started_at`
   (`streak_start_date`), `last_completed_date`, and lifetime statistics

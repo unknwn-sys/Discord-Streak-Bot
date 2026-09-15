@@ -3,7 +3,7 @@ Discord Streak Bot
 ===================
 A single-file, production-oriented Discord bot that recreates the feeling of
 "streaks" for a server: every member keeps a personal streak alive by posting
-at least one message or image anywhere in the server each day.
+at least one message, image, or video anywhere in the server each day.
 
 Run with:  python bot.py
 Requires a .env file (see README.md).
@@ -529,6 +529,13 @@ def year_month_of(day_key: str) -> str:
 
 
 def is_qualifying_message(message: discord.Message) -> bool:
+    """A qualifying activity is any normal user message anywhere in the
+    guild — plain text, an image attachment, a video attachment, or any
+    combination of these. Discord treats attachments (images, videos, GIFs,
+    files, etc.) as part of a single message object, so no separate
+    attachment-type check is needed here: any non-bot, non-webhook, non-
+    system message that reaches this point already counts, regardless of
+    whether it carries text, media, or both."""
     if message.author.bot:
         return False
     if message.webhook_id is not None:
@@ -557,8 +564,8 @@ def build_dashboard_embed() -> discord.Embed:
         description=(
             "Keep your daily streak alive by being active in the server.\n\n"
             "**How it works**\n"
-            "Send at least one message or image anywhere in this server every "
-            "day to maintain your streak.\n\n"
+            "Send at least one message, image, or video anywhere in this server "
+            "every day to maintain your streak.\n\n"
             "**Streak Freeze**\n"
             "Every member receives 3 Streak Freezes per month. If you miss a "
             "day, an available freeze is used automatically."
@@ -629,7 +636,7 @@ def how_it_works_embed() -> discord.Embed:
     embed = discord.Embed(
         title="How It Works",
         description=(
-            "Send at least one message or image anywhere in the server each day.\n\n"
+            "Send at least one message, image, or video anywhere in the server each day.\n\n"
             "Every participant must complete the requirement individually.\n\n"
             "If you miss a day and have a freeze available, it is used automatically.\n\n"
             "If you miss a day with no freeze available, the streak breaks.\n\n"
@@ -650,7 +657,7 @@ def new_day_embed(day_number_label: str, settings: GuildSettings) -> discord.Emb
     embed.add_field(name="Deadline", value=format_deadline(settings.deadline_hour, settings.deadline_minute), inline=True)
     embed.add_field(
         name="Requirement",
-        value="Send at least one message or image anywhere in the server.",
+        value="Send at least one message, image, or video anywhere in the server.",
         inline=False,
     )
     return embed
@@ -662,7 +669,7 @@ def warning_embed(hours_label: str, pending_mentions: str) -> discord.Embed:
         description=(
             f"Only {hours_label} remain.\n\n"
             "Some participants still need to complete today's activity.\n\n"
-            "Send one message or image anywhere in the server to keep the streak alive."
+            "Send one message, image, or video anywhere in the server to keep the streak alive."
         ),
         color=WARN_COLOR,
     )
