@@ -37,3 +37,4 @@ Thumbs.db
 # SSH keys (in case one ever ends up in the project folder)
 *.key
 *.pem
+.env.*
