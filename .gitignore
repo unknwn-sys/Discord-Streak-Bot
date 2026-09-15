@@ -1,0 +1,39 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# SQLite database and its WAL/journal files
+streaks.db
+streaks.db-journal
+streaks.db-wal
+streaks.db-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# SSH keys (in case one ever ends up in the project folder)
+*.key
+*.pem
