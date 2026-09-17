@@ -251,11 +251,63 @@ command. From there you can:
 - Toggle the 2-hour reminder.
 - Toggle the 30-minute reminder.
 - Enable or disable the streak system entirely.
+- Change the hourly quote channel.
+- Change the hourly quote sources (up to 3 RSS feed URLs).
+- Toggle hourly quotes on or off.
 
 Non-administrators only see personal settings and cannot change server
 configuration.
 
-## 22. Data Retention
+## 22. Hourly Quotes
+
+The bot can post one quote or compliment per hour to a channel you
+choose, cycling through up to three configured RSS feeds.
+
+**Configuring it:**
+
+1. Click **Settings → Server Settings → Change Quote Channel** and pick
+   a text channel.
+2. Click **Change Quote Sources** and paste up to three RSS feed URLs,
+   one per site, in the order you want them rotated. Any of the three
+   can be left blank.
+3. Use **Toggle Hourly Quotes** to turn the feature on or off entirely
+   (it is on by default once a quote channel is set).
+
+**How the rotation works:**
+
+- The first post comes from Site 1, the next from Site 2, the next
+  from Site 3, then it repeats. If a configured site is unreachable or
+  returns nothing usable at post time, the bot automatically tries the
+  next configured site instead.
+- If none of the configured feeds return anything, or no feeds are
+  configured at all, the bot posts a quote from a small built-in
+  fallback collection so an hourly post is never missed.
+- Posting is idempotent per hour per server, so a restart or a
+  scheduler tick close to the top of the hour will not produce a
+  duplicate post.
+
+**About the feed URLs:**
+
+Any standard RSS 2.0 or Atom feed that returns quote-like text works.
+A few starting points:
+
+- BrainyQuote publishes a "Quote of the Day" RSS feed.
+- "They Said So" and similar quote sites publish RSS/JSON feeds you can
+  search for by name.
+- A service like RSS.app can convert almost any page that regularly
+  posts quotes or compliments (including many social pages) into a
+  working RSS feed URL you can paste in.
+
+Open a candidate URL directly in a browser first and confirm it
+returns raw XML (not a search results page or a redirect page) before
+pasting it into **Change Quote Sources** — a link from a search engine
+or a social share is not the same as the feed's actual URL.
+
+The bot never stores full articles or feed contents — only the single
+quote text and author (if detected) it posts each hour are sent to
+Discord; nothing from the feed is written to the database.
+
+## 23. Data Retention
 
 - Detailed daily activity records (which day a member sent a qualifying
   message, image, or video) are retained for approximately the last 3
@@ -289,12 +341,28 @@ configuration.
   python bot.py --self-test-cleanup
   ```
 
-## 23. Troubleshooting
+## 24. Troubleshooting
 
 **The bot doesn't post the dashboard.**
 Check that `STREAK_DASHBOARD_CHANNEL_ID` is correct and that the bot
 has View Channel and Send Messages permissions in that channel. Check
 the console logs for a permissions or "channel not found" error.
+
+**Hourly quotes never appear.**
+Confirm a quote channel is set (Settings → Server Settings → Change
+Quote Channel) and that hourly quotes are toggled on. Check the
+console logs — a feed that times out or returns invalid data is logged
+as a warning but never crashes the bot; if you see repeated warnings
+for a specific feed URL, verify that URL actually returns raw RSS/Atom
+XML when opened directly in a browser.
+
+**Quotes keep showing "Source: Local Collection" instead of my feeds.**
+This means none of the configured feed URLs returned usable content at
+post time — usually because the URL isn't a direct feed link (e.g. it's
+a search-engine redirect or a webpage rather than the raw XML), the
+site is blocking automated requests, or the site is temporarily down.
+Open the URL directly in a browser to confirm it returns XML before
+reconfiguring it.
 
 **Daily updates never appear.**
 Make sure a daily updates channel has been selected in

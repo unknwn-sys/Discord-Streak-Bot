@@ -17,16 +17,21 @@ from __future__ import annotations
 
 import os
 import sys
+import re
+import html
+import random
 import sqlite3
 import asyncio
 import logging
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo, available_timezones
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -115,7 +120,14 @@ class Database:
                     streak_enabled INTEGER NOT NULL DEFAULT 1,
                     last_day_key TEXT,
                     last_2h_warn_period TEXT,
-                    last_30m_warn_period TEXT
+                    last_30m_warn_period TEXT,
+                    quote_channel_id TEXT,
+                    quote_feed_1 TEXT,
+                    quote_feed_2 TEXT,
+                    quote_feed_3 TEXT,
+                    quotes_enabled INTEGER NOT NULL DEFAULT 1,
+                    quote_rotation_index INTEGER NOT NULL DEFAULT 0,
+                    last_quote_period TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS dashboard_state (
@@ -211,6 +223,22 @@ class Database:
                 self._conn.execute(
                     "UPDATE users SET status = CASE WHEN current_streak > 0 THEN 'active' ELSE 'inactive' END"
                 )
+
+            guild_cols = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(guild_config)").fetchall()
+            }
+            guild_config_additions = {
+                "quote_channel_id": "TEXT",
+                "quote_feed_1": "TEXT",
+                "quote_feed_2": "TEXT",
+                "quote_feed_3": "TEXT",
+                "quotes_enabled": "INTEGER NOT NULL DEFAULT 1",
+                "quote_rotation_index": "INTEGER NOT NULL DEFAULT 0",
+                "last_quote_period": "TEXT",
+            }
+            for col_name, col_def in guild_config_additions.items():
+                if col_name not in guild_cols:
+                    self._conn.execute(f"ALTER TABLE guild_config ADD COLUMN {col_name} {col_def}")
 
     # -- guild config ---------------------------------------------------
     def get_or_create_guild_config(self, guild_id: str) -> sqlite3.Row:
@@ -470,6 +498,13 @@ class GuildSettings:
     last_day_key: Optional[str]
     last_2h_warn_period: Optional[str]
     last_30m_warn_period: Optional[str]
+    quote_channel_id: Optional[str]
+    quote_feed_1: Optional[str]
+    quote_feed_2: Optional[str]
+    quote_feed_3: Optional[str]
+    quotes_enabled: bool
+    quote_rotation_index: int
+    last_quote_period: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "GuildSettings":
@@ -485,7 +520,18 @@ class GuildSettings:
             last_day_key=row["last_day_key"],
             last_2h_warn_period=row["last_2h_warn_period"],
             last_30m_warn_period=row["last_30m_warn_period"],
+            quote_channel_id=row["quote_channel_id"],
+            quote_feed_1=row["quote_feed_1"],
+            quote_feed_2=row["quote_feed_2"],
+            quote_feed_3=row["quote_feed_3"],
+            quotes_enabled=bool(row["quotes_enabled"]),
+            quote_rotation_index=row["quote_rotation_index"] or 0,
+            last_quote_period=row["last_quote_period"],
         )
+
+    def quote_feeds(self) -> list[str]:
+        """Configured feed URLs in rotation order, skipping any left blank."""
+        return [f for f in (self.quote_feed_1, self.quote_feed_2, self.quote_feed_3) if f]
 
     def tzinfo(self) -> ZoneInfo:
         try:
@@ -715,7 +761,7 @@ def milestone_embed(mention: str, milestone: int) -> discord.Embed:
     return embed
 
 
-def admin_settings_embed(settings: GuildSettings, channel_mention: str) -> discord.Embed:
+def admin_settings_embed(settings: GuildSettings, channel_mention: str, quote_channel_mention: str) -> discord.Embed:
     embed = discord.Embed(title="Streak Configuration", color=INFO_COLOR)
     embed.add_field(name="Daily Updates Channel", value=channel_mention, inline=False)
     embed.add_field(name="Timezone", value=settings.timezone, inline=True)
@@ -723,6 +769,10 @@ def admin_settings_embed(settings: GuildSettings, channel_mention: str) -> disco
     embed.add_field(name="2-Hour Reminder", value="On" if settings.warning_2h_enabled else "Off", inline=True)
     embed.add_field(name="30-Minute Reminder", value="On" if settings.warning_30m_enabled else "Off", inline=True)
     embed.add_field(name="Streak System", value="Enabled" if settings.streak_enabled else "Disabled", inline=True)
+    embed.add_field(name="Quote Channel", value=quote_channel_mention, inline=False)
+    configured_feeds = len(settings.quote_feeds())
+    embed.add_field(name="Quote Sources Configured", value=f"{configured_feeds} / 3", inline=True)
+    embed.add_field(name="Hourly Quotes", value="Enabled" if settings.quotes_enabled else "Disabled", inline=True)
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
@@ -892,6 +942,162 @@ class StreakEngine:
 
 
 # =====================================================================
+# QUOTE SYSTEM
+# =====================================================================
+
+QUOTE_COLOR = discord.Color.dark_gold()
+QUOTE_SOURCE_LABELS = ["Site 1", "Site 2", "Site 3"]
+QUOTE_FETCH_TIMEOUT_SECONDS = 8
+
+# A small curated fallback pool (mixed inspirational and funny) used
+# whenever every configured feed is unreachable, empty, or unconfigured,
+# so the hourly post never silently fails to appear.
+FALLBACK_QUOTES: list[tuple[str, str]] = [
+    ("The only way to do great work is to love what you do.", "Steve Jobs"),
+    ("I have not failed. I've just found 10,000 ways that won't work.", "Thomas Edison"),
+    ("Do or do not. There is no try.", "Yoda"),
+    ("I'm not lazy, I'm just on my energy-saving mode.", "Unknown"),
+    ("The future belongs to those who believe in the beauty of their dreams.", "Eleanor Roosevelt"),
+    ("I am so clever that sometimes I don't understand a single word of what I am saying.", "Oscar Wilde"),
+    ("Whether you think you can or you think you can't, you're right.", "Henry Ford"),
+    ("My bed is a magical place where I suddenly remember everything I forgot to do.", "Unknown"),
+    ("It always seems impossible until it's done.", "Nelson Mandela"),
+    ("I used to think I was indecisive, but now I'm not so sure.", "Unknown"),
+    ("Believe you can and you're halfway there.", "Theodore Roosevelt"),
+    ("Behind every great person is a substantial amount of coffee.", "Unknown"),
+    ("Success is not final, failure is not fatal: it is the courage to continue that counts.", "Winston Churchill"),
+    ("I told my computer I needed a break, and now it won't stop sending me error messages.", "Unknown"),
+    ("The best time to plant a tree was 20 years ago. The second best time is now.", "Chinese Proverb"),
+]
+
+
+def _strip_html(raw: str) -> str:
+    """Removes HTML tags and unescapes entities from RSS item text."""
+    text = re.sub(r"<[^>]+>", "", raw or "")
+    text = html.unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def _split_quote_and_author(text: str) -> tuple[str, Optional[str]]:
+    """Many quote feeds format items as 'Quote text - Author'. Splits that
+    out when the pattern is clearly present; otherwise returns the text as
+    the quote with no author."""
+    match = re.match(r"^(.*\S)\s+[-\u2013\u2014]\s+([^-\u2013\u2014]{2,60})$", text)
+    if match:
+        return match.group(1).strip(" \"'"), match.group(2).strip()
+    return text.strip(" \"'"), None
+
+
+async def fetch_quote_from_feed(url: str) -> Optional[tuple[str, Optional[str]]]:
+    """Fetches an RSS/Atom feed and returns (quote_text, author_or_none) from
+    a randomly chosen item, or None if the feed could not be fetched or
+    parsed. This is deliberately tolerant: any failure just returns None so
+    the caller can fall back to another source."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=QUOTE_FETCH_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0 (StreakBot QuoteFetcher)"}) as resp:
+                if resp.status != 200:
+                    return None
+                raw = await resp.text()
+    except Exception as exc:
+        log.warning("Quote feed fetch failed for %s: %s", url, exc)
+        return None
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+
+    candidates: list[str] = []
+    # Standard RSS 2.0: rss > channel > item > (title|description)
+    for item in root.findall(".//item"):
+        title_el = item.find("title")
+        desc_el = item.find("description")
+        text = ""
+        if desc_el is not None and desc_el.text:
+            text = _strip_html(desc_el.text)
+        if not text and title_el is not None and title_el.text:
+            text = _strip_html(title_el.text)
+        if text:
+            candidates.append(text)
+
+    # Atom fallback: feed > entry > (title|summary)
+    if not candidates:
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall(".//atom:entry", ns):
+            title_el = entry.find("atom:title", ns)
+            summary_el = entry.find("atom:summary", ns)
+            text = ""
+            if summary_el is not None and summary_el.text:
+                text = _strip_html(summary_el.text)
+            if not text and title_el is not None and title_el.text:
+                text = _strip_html(title_el.text)
+            if text:
+                candidates.append(text)
+
+    if not candidates:
+        return None
+
+    chosen = random.choice(candidates)
+    return _split_quote_and_author(chosen)
+
+
+def quote_embed(text: str, author: Optional[str], source_label: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="Quote of the Hour",
+        description=f"\u201c{text}\u201d",
+        color=QUOTE_COLOR,
+    )
+    if author:
+        embed.add_field(name="Author", value=author, inline=True)
+    embed.set_footer(text=f"Source: {source_label}")
+    return embed
+
+
+class QuoteEngine:
+    def __init__(self, bot: "StreakBot"):
+        self.bot = bot
+
+    async def post_hourly_quote(self, guild: discord.Guild, settings: GuildSettings) -> None:
+        channel = await self.bot.get_quote_channel(guild, settings)
+        if channel is None:
+            return
+
+        feeds = settings.quote_feeds()
+        text: Optional[str] = None
+        author: Optional[str] = None
+        source_label = "Local Collection"
+
+        if feeds:
+            # Rotate: 1st post from feed 1, 2nd from feed 2, 3rd from feed
+            # 3, then repeat — falling through to the next feed, then the
+            # local fallback pool, if a source is unreachable or empty.
+            start_index = settings.quote_rotation_index % len(feeds)
+            for offset in range(len(feeds)):
+                idx = (start_index + offset) % len(feeds)
+                result = await fetch_quote_from_feed(feeds[idx])
+                if result and result[0]:
+                    text, author = result
+                    source_label = (
+                        QUOTE_SOURCE_LABELS[idx] if idx < len(QUOTE_SOURCE_LABELS) else f"Feed {idx + 1}"
+                    )
+                    break
+
+        if text is None:
+            text, author = random.choice(FALLBACK_QUOTES)
+
+        try:
+            await channel.send(embed=quote_embed(text, author, source_label))
+        except discord.HTTPException as exc:
+            log.warning("Failed to post hourly quote in guild %s: %s", guild.id, exc)
+            return
+
+        next_index = (settings.quote_rotation_index + 1) % max(len(feeds), 1)
+        await db_call(db.update_guild_config, str(guild.id), quote_rotation_index=next_index)
+
+
+# =====================================================================
 # UI COMPONENTS (dashboard)
 # =====================================================================
 
@@ -1025,6 +1231,89 @@ class ChannelSelectView(discord.ui.View):
         self.add_item(DailyChannelSelect(guild_id))
 
 
+class QuoteChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, guild_id: str):
+        super().__init__(
+            placeholder="Select the quote channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        await db_call(db.update_guild_config, self.guild_id, quote_channel_id=str(channel.id))
+        await interaction.response.send_message(
+            f"Quote channel set to {channel.mention}.", ephemeral=True
+        )
+
+
+class QuoteChannelSelectView(discord.ui.View):
+    def __init__(self, guild_id: str):
+        super().__init__(timeout=120)
+        self.add_item(QuoteChannelSelect(guild_id))
+
+
+class QuoteFeedsModal(discord.ui.Modal, title="Set Quote Sources"):
+    feed_1 = discord.ui.TextInput(
+        label="Site 1 RSS feed URL",
+        placeholder="https://www.brainyquote.com/feeds/todays_quote",
+        required=False,
+        max_length=300,
+    )
+    feed_2 = discord.ui.TextInput(
+        label="Site 2 RSS feed URL",
+        placeholder="https://example.com/feed-2.rss",
+        required=False,
+        max_length=300,
+    )
+    feed_3 = discord.ui.TextInput(
+        label="Site 3 RSS feed URL",
+        placeholder="https://example.com/feed-3.rss",
+        required=False,
+        max_length=300,
+    )
+
+    def __init__(self, bot: "StreakBot", guild_id: str, settings: GuildSettings):
+        super().__init__()
+        self.bot = bot
+        self.guild_id = guild_id
+        self.feed_1.default = settings.quote_feed_1 or ""
+        self.feed_2.default = settings.quote_feed_2 or ""
+        self.feed_3.default = settings.quote_feed_3 or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        def clean(value: str) -> Optional[str]:
+            value = value.strip()
+            return value or None
+
+        urls = [clean(self.feed_1.value), clean(self.feed_2.value), clean(self.feed_3.value)]
+        for url in urls:
+            if url and not (url.startswith("http://") or url.startswith("https://")):
+                await interaction.response.send_message(
+                    f"'{url}' doesn't look like a valid URL. Feed URLs must start with http:// or https://.",
+                    ephemeral=True,
+                )
+                return
+
+        await db_call(
+            db.update_guild_config,
+            self.guild_id,
+            quote_feed_1=urls[0],
+            quote_feed_2=urls[1],
+            quote_feed_3=urls[2],
+            quote_rotation_index=0,
+        )
+        configured = sum(1 for u in urls if u)
+        await interaction.response.send_message(
+            f"Quote sources updated ({configured} / 3 configured). "
+            "Posts rotate through them in order; any unreachable or unconfigured "
+            "source falls back to the next one, then to a built-in quote collection.",
+            ephemeral=True,
+        )
+
+
 class AdminSettingsView(discord.ui.View):
     def __init__(self, bot: "StreakBot", guild_id: str, settings: GuildSettings):
         super().__init__(timeout=180)
@@ -1070,6 +1359,24 @@ class AdminSettingsView(discord.ui.View):
             f"Streak system is now {'enabled' if new_val else 'disabled'}.", ephemeral=True
         )
 
+    @discord.ui.button(label="Change Quote Channel", style=discord.ButtonStyle.primary, row=2)
+    async def change_quote_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Select the channel for hourly quotes:", view=QuoteChannelSelectView(self.guild_id), ephemeral=True
+        )
+
+    @discord.ui.button(label="Change Quote Sources", style=discord.ButtonStyle.primary, row=2)
+    async def change_quote_sources(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(QuoteFeedsModal(self.bot, self.guild_id, self.settings))
+
+    @discord.ui.button(label="Toggle Hourly Quotes", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle_quotes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_val = 0 if self.settings.quotes_enabled else 1
+        await db_call(db.update_guild_config, self.guild_id, quotes_enabled=new_val)
+        await interaction.response.send_message(
+            f"Hourly quotes are now {'enabled' if new_val else 'disabled'}.", ephemeral=True
+        )
+
 
 # =====================================================================
 # BOT
@@ -1083,6 +1390,7 @@ class StreakBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.engine = StreakEngine(self)
+        self.quote_engine = QuoteEngine(self)
         self._scheduler_started = False
         self._cleanup_started = False
 
@@ -1152,6 +1460,18 @@ class StreakBot(commands.Bot):
                 return None
         return channel
 
+    async def get_quote_channel(self, guild: discord.Guild, settings: GuildSettings) -> Optional[discord.TextChannel]:
+        if not settings.quote_channel_id:
+            return None
+        channel = guild.get_channel(int(settings.quote_channel_id))
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(int(settings.quote_channel_id))
+            except discord.HTTPException:
+                log.warning("Configured quote channel missing for guild %s.", guild.id)
+                return None
+        return channel
+
     # -- button handlers -------------------------------------------------
     async def handle_my_streak(self, interaction: discord.Interaction):
         guild_id = str(interaction.guild_id)
@@ -1209,7 +1529,8 @@ class StreakBot(commands.Bot):
         config_row = await db_call(db.get_or_create_guild_config, guild_id)
         settings = GuildSettings.from_row(config_row)
         channel_mention = f"<#{settings.daily_channel_id}>" if settings.daily_channel_id else "Not configured"
-        embed = admin_settings_embed(settings, channel_mention)
+        quote_channel_mention = f"<#{settings.quote_channel_id}>" if settings.quote_channel_id else "Not configured"
+        embed = admin_settings_embed(settings, channel_mention, quote_channel_mention)
         view = AdminSettingsView(self, guild_id, settings)
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
@@ -1247,9 +1568,14 @@ class StreakBot(commands.Bot):
         guild_id = str(guild.id)
         config_row = await db_call(db.get_or_create_guild_config, guild_id)
         settings = GuildSettings.from_row(config_row)
-        if not settings.streak_enabled:
-            return
 
+        if settings.streak_enabled:
+            await self._tick_streak(guild, guild_id, settings)
+
+        if settings.quotes_enabled:
+            await self._tick_quote(guild, guild_id, settings)
+
+    async def _tick_streak(self, guild: discord.Guild, guild_id: str, settings: GuildSettings) -> None:
         tz = settings.tzinfo()
         now_local = datetime.now(tz)
         current_period = period_key_for(now_local, settings.deadline_hour, settings.deadline_minute)
@@ -1295,6 +1621,17 @@ class StreakBot(commands.Bot):
             await self.engine.send_warning(guild, settings, current_period, "30 minutes")
             await db_call(db.update_guild_config, guild_id, last_30m_warn_period=current_period)
 
+    async def _tick_quote(self, guild: discord.Guild, guild_id: str, settings: GuildSettings) -> None:
+        if not settings.quote_channel_id:
+            return
+        tz = settings.tzinfo()
+        now_local = datetime.now(tz)
+        current_hour_key = now_local.strftime("%Y-%m-%d-%H")
+        if settings.last_quote_period == current_hour_key:
+            return
+        await db_call(db.update_guild_config, guild_id, last_quote_period=current_hour_key)
+        await self.quote_engine.post_hourly_quote(guild, settings)
+
 
 bot = StreakBot()
 
@@ -1332,7 +1669,8 @@ async def streak_admin(interaction: discord.Interaction):
     config_row = await db_call(db.get_or_create_guild_config, guild_id)
     settings = GuildSettings.from_row(config_row)
     channel_mention = f"<#{settings.daily_channel_id}>" if settings.daily_channel_id else "Not configured"
-    embed = admin_settings_embed(settings, channel_mention)
+    quote_channel_mention = f"<#{settings.quote_channel_id}>" if settings.quote_channel_id else "Not configured"
+    embed = admin_settings_embed(settings, channel_mention, quote_channel_mention)
     view = AdminSettingsView(bot, guild_id, settings)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
